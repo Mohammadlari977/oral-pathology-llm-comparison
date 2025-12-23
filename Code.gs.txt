@@ -1,0 +1,159 @@
+/***** CONFIGURATION *****/
+const CFG = {
+  START_CASE: 1,    
+  END_CASE: 170,      
+  SHEET_NAME: "Oral_Pathology_Multi_LLM_Study",
+  RUNS: 3,           
+  TEMPERATURE: 0.7,
+  // These names must match the 'Property' field in your Script Settings
+  KEYS: {
+    OPENAI: "OPENAI_API_KEY",
+    DEEPSEEK: "DEEPSEEK_API_KEY",
+    ANTHROPIC: "ANTHROPIC_API_KEY",
+    GEMINI: "GEMINI_API_KEY",
+    XAI: "XAI_API_KEY" // Used for Grok models
+  }
+};
+
+/***** ENTRYPOINT *****/
+function runComprehensiveStudy() {
+  const sh = getOrCreateSheet_();
+  const props = PropertiesService.getScriptProperties();
+  let currentCase = Number(props.getProperty("CURRENT_CASE")) || CFG.START_CASE;
+
+  // Stop script once the target range is reached
+  if (currentCase > CFG.END_CASE) {
+    Logger.log("✅ Study completed for cases 1-170.");
+    props.deleteProperty("CURRENT_CASE");
+    return;
+  }
+
+  const docName = "Case " + currentCase;
+  const caseText = loadDocTextByName_(docName);
+  
+  if (!caseText) {
+    Logger.log("⚠️ File missing: " + docName);
+  } else {
+    const prompt = buildPrompt_(caseText);
+
+    for (let run = 1; run <= CFG.RUNS; run++) {
+      // Execute requests for all 10 model variants
+      const results = [
+        callOpenAI_("gpt-4o", prompt),
+        callOpenAI_("gpt-4o-mini", prompt),
+        callDeepSeek_("deepseek-chat", prompt),
+        callDeepSeek_("deepseek-reasoner", prompt),
+        callClaude_("claude-3-5-sonnet-20241022", prompt),
+        callClaude_("claude-3-5-haiku-20241022", prompt),
+        callGemini_("gemini-1.5-pro", prompt),
+        callGemini_("gemini-1.5-flash", prompt),
+        callGrok_("grok-2-1212", prompt),
+        callGrok_("grok-2-mini", prompt)
+      ];
+
+      const rowData = [docName + ` (Run ${run})`];
+      results.forEach(res => rowData.push(...extractTop3_(res)));
+      sh.appendRow(rowData);
+      
+      // Safety pause to prevent hitting rate limits
+      Utilities.sleep(1500); 
+    }
+  }
+
+  // Increment and trigger next case
+  props.setProperty("CURRENT_CASE", currentCase + 1);
+  scheduleNextRun_();
+}
+
+/***** API ADAPTERS *****/
+
+function callOpenAI_(model, prompt) {
+  const key = PropertiesService.getScriptProperties().getProperty(CFG.KEYS.OPENAI);
+  const payload = { model: model, messages: [{role: "user", content: prompt}], temperature: CFG.TEMPERATURE };
+  return fetchApi_("https://api.openai.com/v1/chat/completions", "Bearer " + key, payload);
+}
+
+function callDeepSeek_(model, prompt) {
+  const key = PropertiesService.getScriptProperties().getProperty(CFG.KEYS.DEEPSEEK);
+  const payload = { model: model, messages: [{role: "user", content: prompt}], temperature: CFG.TEMPERATURE };
+  return fetchApi_("https://api.deepseek.com/chat/completions", "Bearer " + key, payload);
+}
+
+function callClaude_(model, prompt) {
+  const key = PropertiesService.getScriptProperties().getProperty(CFG.KEYS.ANTHROPIC);
+  const options = {
+    method: "post",
+    headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
+    payload: JSON.stringify({ 
+      model: model, 
+      max_tokens: 1024, 
+      messages: [{role: "user", content: prompt}], 
+      temperature: CFG.TEMPERATURE 
+    }),
+    muteHttpExceptions: true
+  };
+  const res = UrlFetchApp.fetch("https://api.anthropic.com/v1/messages", options);
+  return res.getResponseCode() === 200 ? JSON.parse(res.getContentText()).content[0].text : "";
+}
+
+function callGemini_(model, prompt) {
+  const key = PropertiesService.getScriptProperties().getProperty(CFG.KEYS.GEMINI);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
+  const payload = { 
+    contents: [{ parts: [{ text: prompt }] }], 
+    generationConfig: { temperature: CFG.TEMPERATURE } 
+  };
+  const res = UrlFetchApp.fetch(url, { method: "post", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true });
+  return res.getResponseCode() === 200 ? JSON.parse(res.getContentText()).candidates[0].content.parts[0].text : "";
+}
+
+function callGrok_(model, prompt) {
+  const key = PropertiesService.getScriptProperties().getProperty(CFG.KEYS.XAI);
+  const payload = { model: model, messages: [{role: "user", content: prompt}], temperature: CFG.TEMPERATURE };
+  return fetchApi_("https://api.x.ai/v1/chat/completions", "Bearer " + key, payload);
+}
+
+/***** HELPERS *****/
+
+function fetchApi_(url, auth, payload) {
+  const options = { method: "post", headers: { "Authorization": auth, "Content-Type": "application/json" }, payload: JSON.stringify(payload), muteHttpExceptions: true };
+  const res = UrlFetchApp.fetch(url, options);
+  return res.getResponseCode() === 200 ? JSON.parse(res.getContentText()).choices[0].message.content : "";
+}
+
+function extractTop3_(text) {
+  if (!text) return ["", "", ""];
+  const lines = text.split("\n").map(s => s.trim()).filter(Boolean);
+  let ddx = lines.filter(l => /^\d\.\s+/.test(l)).slice(0, 3);
+  let cleaned = ddx.map(l => l.replace(/^(\d\.\s+)/, "").trim());
+  while (cleaned.length < 3) cleaned.push(""); 
+  return cleaned;
+}
+
+function loadDocTextByName_(name) {
+  const it = DriveApp.getFilesByName(name);
+  return it.hasNext() ? DocumentApp.openById(it.next().getId()).getBody().getText() : "";
+}
+
+function buildPrompt_(caseText) {
+  return "You are a clinical expert. Return ONLY the top 3 differential diagnoses as a numbered list (1., 2., 3.) — short disease names only, no explanations.\n\n" + caseText;
+}
+
+function getOrCreateSheet_() {
+  const files = DriveApp.getFilesByName(CFG.SHEET_NAME);
+  let ss = files.hasNext() ? SpreadsheetApp.open(files.next()) : SpreadsheetApp.create(CFG.SHEET_NAME);
+  const sh = ss.getSheets()[0];
+  if (sh.getLastRow() === 0) {
+    const headers = ["Case"];
+    const models = ["GPT-4o", "GPT-4o-m", "DS-Chat", "DS-Reason", "Claude-S", "Claude-H", "Gemini-P", "Gemini-F", "Grok-2", "Grok-m"];
+    models.forEach(m => headers.push(m + " 1", m + " 2", m + " 3"));
+    sh.appendRow(headers);
+  }
+  return sh;
+}
+
+function scheduleNextRun_() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let t of triggers) if (t.getHandlerFunction() === "runComprehensiveStudy") ScriptApp.deleteTrigger(t);
+  ScriptApp.newTrigger("runComprehensiveStudy").timeBased().after(20000).create();
+}
