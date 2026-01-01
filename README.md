@@ -35,4 +35,4 @@ The clinical case data are derived from the [University of Washington Oral Patho
 
 ## Citation
 If you use this code in your research, please cite it using the DOI provided via Zenodo:
-`[Insert your Zenodo DOI here]`
+` DOI: 10.5281/zenodo.18029822`
